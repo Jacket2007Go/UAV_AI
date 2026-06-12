@@ -57,13 +57,56 @@ parser.add_argument("--cert_R_weight", type=float, default=2.0,
                     help="DEAD parameter retained for compatibility")
 parser.add_argument("--cert_Q_weight", type=float, default=1.0,
                     help="DEAD parameter retained for compatibility")
-# Hard-certificate hyperparameters (used by certenv hard-cert variant)
-parser.add_argument("--cert_tau", type=float, default=0.25,
-                    help="Slack tolerance for comm/sense thresholds (fraction below median)")
+# Certificate hyperparameters (review §4.1/§4.2/§5.4/§5.6)
+parser.add_argument("--cert_tau", type=float, default=None,
+                    help="Legacy single slack: sets BOTH tau_R and tau_S if given")
+parser.add_argument("--cert_tau_R", type=float, default=0.25,
+                    help="Relative rate slack tau_R (review §4.2)")
+parser.add_argument("--cert_tau_S", type=float, default=0.25,
+                    help="Relative sensing slack tau_S (review §4.2)")
+parser.add_argument("--cert_R_abs", type=float, default=0.5,
+                    help="Absolute mission rate floor R_abs in bps/Hz; 0 = relative-only ablation")
+parser.add_argument("--cert_S_abs", type=float, default=0.02,
+                    help="Absolute mission sensing floor S_abs; 0 = relative-only ablation")
+parser.add_argument("--cert_E_min", type=float, default=0.10,
+                    help="Energy gate E_min (review §4.1)")
+parser.add_argument("--cert_d_min", type=float, default=114.0,
+                    help="Absolute safety-distance gate d_min in env units (review §4.1)")
+parser.add_argument("--cert_mode", type=str, default="soft",
+                    choices=["soft", "hard"],
+                    help="soft: magnitude-scaled penalty p_i^cert (review §5.6); "
+                         "hard: legacy constant per-failure penalty")
+parser.add_argument("--cert_lambda_R", type=float, default=0.30)
+parser.add_argument("--cert_lambda_S", type=float, default=10.0)
+parser.add_argument("--cert_lambda_E", type=float, default=2.0)
+parser.add_argument("--cert_lambda_D", type=float, default=0.01)
+parser.add_argument("--cert_alpha_C",  type=float, default=1.0,
+                    help="alpha_C multiplier on p_i^cert in the reward (review §5.7)")
+parser.add_argument("--cert_rho_R", type=float, default=0.95,
+                    help="EMA persistence rho_R for D_i^R (review §5.5)")
+parser.add_argument("--cert_rho_S", type=float, default=0.95,
+                    help="EMA persistence rho_S for D_i^S (review §5.5)")
 parser.add_argument("--cert_alpha", type=float, default=0.40,
-                    help="Proximity threshold as fraction of max pairwise dist (monitored, not gating)")
+                    help="Legacy relative proximity threshold (logged only)")
 parser.add_argument("--cert_lambda", type=float, default=0.5,
-                    help="Per-failure reward penalty multiplier (× reward_scale)")
+                    help="Hard-mode constant penalty multiplier (× reward_scale)")
+# Sensing model (review §4.4/§5.3)
+parser.add_argument("--sensing_metric", type=str, default="fim_min_eig",
+                    choices=["fim_min_eig", "crb_trace", "snr"],
+                    help="Scalar sensing quality S_i: lambda_min(FIM), 1/tr(CRB), or legacy SNR proxy")
+# Joint fairness weights (review §5.9)
+parser.add_argument("--omega_R", type=float, default=0.5,
+                    help="J_JSC weight on J_R (omega_R + omega_S = 1)")
+parser.add_argument("--omega_S", type=float, default=0.5,
+                    help="J_JSC weight on J_S")
+# Critic rotation interval K (was hardcoded MIN_TENURE = 200)
+parser.add_argument("--rotation_interval", type=int, default=200,
+                    help="Minimum consecutive hosting episodes K before re-selection")
+# Critic-host eligibility set E_set(t) extras (review §5.8)
+parser.add_argument("--load_max", type=float, default=1.0,
+                    help="Duty-share eligibility cap l_max")
+parser.add_argument("--sync_rate_min", type=float, default=0.0,
+                    help="Host-to-swarm sync link-rate floor R_min^sync (bps)")
 # Weighted critic hyperparameters (only active for dc / dccert)
 parser.add_argument("--alpha_E", type=float, default=0.25)
 parser.add_argument("--alpha_L", type=float, default=0.20)
@@ -86,7 +129,14 @@ torch.manual_seed(args.seed)
 # critic_mode: 'fixed' (uav_0 always) or 'weighted' (rotating prefect)
 # use_proj  : whether to apply SafeActionProjector (Step 4)
 MODEL_CONFIGS = {
-    "original": dict(env_type="org",  obs_dim=12, critic_mode="fixed",    use_proj=False),
+    # NOTE (review §4.3/§4.7): the Original baseline now runs on dcenv with
+    # critic_mode='fixed' (static critic at uav_0, no projection, no certs).
+    # dcenv in fixed mode is architecturally identical to the legacy orgenv
+    # baseline, but carries the corrected link budget (thermal noise N0*B,
+    # bps rates, FIM sensing, normalized rewards). All four variants must
+    # share the same physics or the paired deltas dJ_m = V4 - V1 are
+    # meaningless. orgenv.py is retained only as a legacy reference.
+    "original": dict(env_type="dc",   obs_dim=12, critic_mode="fixed",    use_proj=False),
     "cert":     dict(env_type="cert", obs_dim=15, critic_mode="fixed",    use_proj=True),
     "dc":       dict(env_type="dc",   obs_dim=12, critic_mode="weighted", use_proj=True),
     "dccert":   dict(env_type="cert", obs_dim=15, critic_mode="weighted", use_proj=True),
@@ -131,24 +181,41 @@ elif cfg["env_type"] == "dc":
     from dcenv import UAVJSCEnv
     env = UAVJSCEnv(num_uavs=NUM_UAVS, motion_case="all_move",
                     critic_mode=cfg["critic_mode"])
-    env.configure_weighted_selector(
-        alpha_E=args.alpha_E, alpha_L=args.alpha_L,
-        alpha_C=args.alpha_C, alpha_S=args.alpha_S,
-        alpha_P=args.alpha_P, alpha_W=args.alpha_W,
-        energy_threshold=args.energy_threshold,
-        duty_threshold=args.duty_threshold,
-    )
+    if cfg["critic_mode"] == "weighted":
+        env.configure_weighted_selector(
+            alpha_E=args.alpha_E, alpha_L=args.alpha_L,
+            alpha_C=args.alpha_C, alpha_S=args.alpha_S,
+            alpha_P=args.alpha_P, alpha_W=args.alpha_W,
+            energy_threshold=args.energy_threshold,
+            duty_threshold=args.duty_threshold,
+            load_max=args.load_max,
+            sync_rate_min=args.sync_rate_min,
+        )
 
 elif cfg["env_type"] == "cert":
     from certenv import CertUAVJSCEnv
     env = CertUAVJSCEnv(
         num_uavs=NUM_UAVS, motion_case="all_move",
         critic_mode=cfg["critic_mode"],
-        cert_tau    = args.cert_tau,
-        cert_alpha  = args.cert_alpha,
-        cert_lambda = args.cert_lambda,
-        cert_R_weight=args.cert_R_weight,   # dead — for compatibility
-        cert_Q_weight=args.cert_Q_weight,   # dead — for compatibility
+        cert_tau      = args.cert_tau,        # legacy: overrides both taus
+        cert_tau_R    = args.cert_tau_R,
+        cert_tau_S    = args.cert_tau_S,
+        cert_R_abs    = args.cert_R_abs,
+        cert_S_abs    = args.cert_S_abs,
+        cert_E_min    = args.cert_E_min,
+        cert_d_min    = args.cert_d_min,
+        cert_mode     = args.cert_mode,
+        cert_lambda_R = args.cert_lambda_R,
+        cert_lambda_S = args.cert_lambda_S,
+        cert_lambda_E = args.cert_lambda_E,
+        cert_lambda_D = args.cert_lambda_D,
+        cert_alpha_C  = args.cert_alpha_C,
+        cert_rho_R    = args.cert_rho_R,
+        cert_rho_S    = args.cert_rho_S,
+        cert_alpha    = args.cert_alpha,
+        cert_lambda   = args.cert_lambda,
+        cert_R_weight = args.cert_R_weight,   # dead — for compatibility
+        cert_Q_weight = args.cert_Q_weight,   # dead — for compatibility
     )
     # NOTE: NO configure_fairness_weights() override here.
     # Previously this used eta_R=6.0, eta_Q=3.0 (2x the default 3.0/1.5)
@@ -164,7 +231,15 @@ elif cfg["env_type"] == "cert":
             alpha_P=args.alpha_P, alpha_W=args.alpha_W,
             energy_threshold=args.energy_threshold,
             duty_threshold=args.duty_threshold,
+            load_max=args.load_max,
+            sync_rate_min=args.sync_rate_min,
         )
+
+# Sensing metric (review §4.4/§5.3) and joint-fairness weights (review §5.9)
+# apply uniformly across all env variants so the comparison stays an ablation.
+env.sensing_metric = args.sensing_metric
+env.omega_R_jain   = args.omega_R
+env.omega_S_jain   = args.omega_S
 
 agents        = env.possible_agents[:]
 N             = len(agents)
@@ -244,6 +319,13 @@ critic_opt    = optim.Adam(critic.parameters(), lr=1e-4)
 # Step 4: safe action projector (used by cert / dc / dccert)
 projector = SafeActionProjector(max_power=env.max_power, act_dim=act_dim)
 
+# Review §4.5: |psi| = critic model size in bits (float32 weights) for the
+# migration energy model E_sync = P_tx * |psi| / R_{i->j}.
+if hasattr(env, "psi_bits"):
+    env.psi_bits = 32.0 * float(sum(p.numel() for p in critic.parameters()))
+    print(f"[train] critic size |psi| = {env.psi_bits/8/1024:.1f} kB "
+          f"({env.psi_bits:.3g} bits) — used for E_sync")
+
 print(f"[train] global_obs_dim={global_obs_dim} | joint_act_dim={joint_act_dim} | "
       f"actor params={sum(p.numel() for p in actors[agents[0]].parameters()):,} | "
       f"critic params={sum(p.numel() for p in critic.parameters()):,}")
@@ -304,6 +386,19 @@ all_energy_eff   = []
 all_jain         = []
 all_cert_comm    = []   # cert variants: mean communication deficit
 all_cert_sense   = []   # cert variants: mean sensing deficit
+# Review §5.9 / §6.3 metrics (all variants)
+all_jain_S       = []   # sensing Jain J_S
+all_jain_JSC     = []   # joint Jain J_JSC
+all_min_rate     = []   # min_i R_i (bps)
+all_min_sensing  = []   # min_i S_i
+all_sum_eta      = []   # sum spectral efficiency (bps/Hz)
+all_energy_imb   = []   # I_E energy-imbalance (end of episode)
+all_comp_energy  = []   # cumulative critic-hosting compute energy
+all_sync_energy  = []   # cumulative critic-migration sync energy
+# Review §5.6 / §6.3 certificate metrics (cert variants; NaN otherwise)
+all_m_qos        = []   # M_QoS minimum-service metric
+all_cert_viol    = []   # mean violation magnitude (not just pass/fail)
+all_cert_soft    = []   # mean soft certificate value C~
 
 # ── Hard-certificate diagnostic logging (cert variants only) ──────────────
 # Per-episode aggregates suitable for diagnose_certificate.py:
@@ -337,7 +432,7 @@ all_per_agent_pass    = []   # fraction of steps each agent passed cert
 # Tenure gate: critic host is held for a minimum of K episodes before the
 # weighted selector is allowed to reconsider (Option A — re-evaluates every
 # episode once K is met, resets on switch, increments on re-selection).
-MIN_TENURE    = 200
+MIN_TENURE    = int(args.rotation_interval)   # K (review: swept hyperparameter)
 critic_tenure = 0   # episodes current host has served consecutively
 
 for ep in range(episodes):
@@ -374,6 +469,15 @@ for ep in range(episodes):
             # in the result for another full MIN_TENURE.
             env.select_active_critic(global_step=ep)
             critic_tenure = 0   # always reset, whether host changed or not
+            # Review §4.5: charge migration energy E_sync = P_tx|psi|/R_{i->j}
+            # to the old host when the critic actually moves.
+            if (env.active_critic_agent != prev_critic
+                    and hasattr(env, "charge_critic_sync")):
+                e_sync = env.charge_critic_sync(prev_critic,
+                                                env.active_critic_agent)
+                if e_sync > 0:
+                    print(f"  [rotate] ep {ep}: critic {prev_critic} -> "
+                          f"{env.active_critic_agent} | E_sync={e_sync:.5f}")
 
     obs, _ = env.reset()
     done   = False
@@ -381,6 +485,9 @@ for ep in range(episodes):
     ep_pr = []; ep_dr  = []; ep_jain = []
     ep_closs = []; ep_sr = []; ep_sq = []; ep_ee = []
     ep_cert_c = []; ep_cert_s = []
+    ep_jain_S = []; ep_jain_JSC = []
+    ep_min_r  = []; ep_min_s    = []; ep_eta = []
+    ep_mqos   = []; ep_viol     = []; ep_soft = []
     # Hard-cert per-step accumulators (only populated if env exposes them)
     ep_issued     = []
     ep_comm_pass  = []
@@ -436,6 +543,22 @@ for ep in range(episodes):
             ep_cert_c.append(float(np.mean(list(env.cert_comm_deficit.values()))))
         if hasattr(env, "cert_sense_deficit"):
             ep_cert_s.append(float(np.mean(list(env.cert_sense_deficit.values()))))
+        # Review §5.9 fairness on both services; §6.3 min-service metrics
+        if hasattr(env, "last_jain_S"):
+            ep_jain_S.append(float(env.last_jain_S))
+            ep_jain_JSC.append(float(env.last_jain_JSC))
+        if hasattr(env, "last_min_rate"):
+            ep_min_r.append(float(env.last_min_rate))
+            ep_min_s.append(float(env.last_min_sensing))
+        if hasattr(env, "last_spectral_eff"):
+            ep_eta.append(float(sum(env.last_spectral_eff[a] for a in agents)))
+        # Review §5.6/§6.3 certificate magnitude metrics (cert variants)
+        if hasattr(env, "last_m_qos"):
+            ep_mqos.append(float(env.last_m_qos))
+            ep_viol.append(float(np.mean(
+                [env.last_per_agent_violation[a] for a in agents])))
+            ep_soft.append(float(np.mean(
+                [env.last_cert_soft[a] for a in agents])))
 
         # Hard-cert per-step diagnostics (cert variants only).
         # All these attrs are populated by certenv._evaluate_certificates().
@@ -530,6 +653,13 @@ for ep in range(episodes):
                 torch.nn.utils.clip_grad_norm_(critic.parameters(), 1.0)
                 critic_opt.step()
 
+                # Review §4.5: E_comp = kappa_i C_i f_i^2 charged to the
+                # ACTIVE critic host for this update. Under the fixed-critic
+                # variants uav_0 pays every update — this is precisely the
+                # energy-imbalance mechanism the moving critic removes.
+                if hasattr(env, "charge_critic_compute"):
+                    env.charge_critic_compute()
+
                 # Actor update (gradient through shared critic)
                 chunks = split_global_obs(S)
                 A_pi   = torch.cat([actors[a](ch)
@@ -561,6 +691,21 @@ for ep in range(episodes):
     all_jain       .append(np.nanmean(ep_jain)   if ep_jain   else np.nan)
     all_cert_comm  .append(np.nanmean(ep_cert_c) if ep_cert_c else np.nan)
     all_cert_sense .append(np.nanmean(ep_cert_s) if ep_cert_s else np.nan)
+    all_jain_S     .append(np.nanmean(ep_jain_S)   if ep_jain_S   else np.nan)
+    all_jain_JSC   .append(np.nanmean(ep_jain_JSC) if ep_jain_JSC else np.nan)
+    all_min_rate   .append(np.nanmean(ep_min_r)    if ep_min_r    else np.nan)
+    all_min_sensing.append(np.nanmean(ep_min_s)    if ep_min_s    else np.nan)
+    all_sum_eta    .append(np.nanmean(ep_eta)      if ep_eta      else np.nan)
+    all_m_qos      .append(np.nanmean(ep_mqos)     if ep_mqos     else np.nan)
+    all_cert_viol  .append(np.nanmean(ep_viol)     if ep_viol     else np.nan)
+    all_cert_soft  .append(np.nanmean(ep_soft)     if ep_soft     else np.nan)
+    # Review §4.5/§6.3: whole-run energy bookkeeping snapshots
+    all_energy_imb .append(env.energy_imbalance()
+                           if hasattr(env, "energy_imbalance") else np.nan)
+    all_comp_energy.append(env.total_comp_energy()
+                           if hasattr(env, "total_comp_energy") else np.nan)
+    all_sync_energy.append(env.total_sync_energy()
+                           if hasattr(env, "total_sync_energy") else np.nan)
 
     # Hard-cert per-episode aggregates (NaN when env has no cert hooks)
     if ep_issued:
@@ -607,9 +752,11 @@ for ep in range(episodes):
         avg_pr  = np.nanmean(ep_pr)    if ep_pr    else float("nan")
         avg_cc  = np.nanmean(ep_cert_c) if ep_cert_c else float("nan")
         rwd_str = " ".join([f"{a}={ep_r[a]:.2f}" for a in agents])
+        avg_js  = np.nanmean(ep_jain_S) if ep_jain_S else float("nan")
+        avg_mq  = np.nanmean(ep_mqos)   if ep_mqos   else float("nan")
         print(f"Ep {ep:4d}/{episodes} | {args.model_type} | N={NUM_UAVS} | "
-              f"Jain={avg_j:.4f} | Rate={avg_sr:.3f} | EE={avg_ee:.3f} | "
-              f"PrRes={avg_pr:.3f} | CertC={avg_cc:.4f} | "
+              f"J_R={avg_j:.4f} | J_S={avg_js:.4f} | Rate={avg_sr:.3g}bps | "
+              f"EE={avg_ee:.3g} | PrRes={avg_pr:.3f} | M_QoS={avg_mq:.3f} | "
               f"noise={noise_std:.3f} | Rwd:[{rwd_str}]")
 
 # ---------------------------------------------------------------------------
@@ -627,6 +774,20 @@ curves = {
     "Jain_Fairness":      all_jain,
     "Cert_Comm_Deficit":  all_cert_comm,
     "Cert_Sense_Deficit": all_cert_sense,
+    # Review §5.9 / §6.3 — fairness on both services + minimum service
+    "Jain_Sensing":       all_jain_S,
+    "Jain_JSC":           all_jain_JSC,
+    "Min_Rate_bps":       all_min_rate,
+    "Min_Sensing":        all_min_sensing,
+    "Sum_Spectral_Eff":   all_sum_eta,
+    # Review §4.5 / §6.3 — energy accounting
+    "Energy_Imbalance":   all_energy_imb,
+    "Comp_Energy_Cum":    all_comp_energy,
+    "Sync_Energy_Cum":    all_sync_energy,
+    # Review §5.6 / §6.3 — certificate magnitude metrics
+    "M_QoS":              all_m_qos,
+    "Cert_Violation_Mag": all_cert_viol,
+    "Cert_Soft_Value":    all_cert_soft,
     # Hard-cert diagnostics (NaN-filled for non-cert variants)
     "Cert_Issued_Count":  all_cert_issued,
     "Cert_Pass_Rate":     all_cert_pass_rate,

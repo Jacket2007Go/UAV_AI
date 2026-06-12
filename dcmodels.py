@@ -12,7 +12,9 @@ Proposal architecture mapping
 Distributed-critic PDF mapping (Eqs 1-3)
 ══════════════════════════════════════════════════════════════════════════════
  CriticCoordinatorConfig   holds α weights for Eq.(2)
- WeightedCriticSelector    implements Eq.(2) Q_i(t) and Eq.(3) i*(t)
+ WeightedCriticSelector    implements Eq.(2) H_i(t) and Eq.(3) i*(t)
+                           (score renamed Q->H per review §5.8 to avoid
+                           collision with the action-value function Q)
  Fixed / round-robin modes also available (PDF §2)
 """
 
@@ -108,10 +110,18 @@ class CriticCoordinatorConfig:
 
     Proposal / PDF mapping:
         critic_mode  selects the strategy from PDF §2 (round-robin) or §3 (weighted).
-        alpha_*      are the α weights in PDF Eq.(2):
-                       Q_i(t) = α_E Ẽ_i + α_L L̃_i + α_C C̃_i
+        alpha_*      are the α weights in PDF Eq.(2) — score renamed H_i
+                     (review §5.8) to avoid collision with the critic's
+                     action-value function Q(s,a):
+                       H_i(t) = α_E Ẽ_i + α_L L̃_i + α_C C̃_i
                                + α_S S̃_i + α_P P̃_i + α_W W̃_i
         *_threshold  guard conditions from PDF §3.2 ("meets thresholds?" branch).
+
+    Eligibility set (review §5.8):
+        E_set(t) = { i : E_i ≥ energy_threshold,
+                         duty_share_i ≤ load_max,
+                         R_sync,i ≥ sync_rate_min }
+        i*(t) = argmax_{i ∈ E_set(t)} H_i(t)
     """
     # Selection strategy
     critic_mode: str = "fixed"     # 'fixed' | 'round_robin' | 'weighted'
@@ -127,6 +137,10 @@ class CriticCoordinatorConfig:
     # Threshold guards (PDF §3.2 — "meets thresholds?" gate)
     energy_threshold: float = 0.10   # min energy fraction to be eligible
     duty_threshold:   float = 0.50   # max duty share before willingness is reduced
+
+    # Eligibility-set caps (review §5.8)
+    load_max:      float = 1.00      # max duty share l_max to remain eligible
+    sync_rate_min: float = 0.00      # min host→swarm sync link rate R_min^sync [bps]
 
 
 class WeightedCriticSelector:
@@ -163,12 +177,14 @@ class WeightedCriticSelector:
         max_dist:       float,
     ) -> Tuple[Dict[str, float], Dict[str, Dict[str, float]]]:
         """
-        Compute per-agent Q_i(t) scores  (PDF Eq. 2).
+        Compute per-agent H_i(t) host-preference scores  (PDF Eq. 2,
+        renamed Q→H per review §5.8).
 
         Returns
         -------
-        scores     : {agent: Q_i}
-        components : {agent: {E, L, C, S, P, W, Q}} — for logging
+        scores     : {agent: H_i}
+        components : {agent: {E, L, C, S, P, W, H, Q}} — 'Q' kept as a
+                     backward-compatible alias of 'H' for old plot scripts.
         """
         eps = 1e-8
 
@@ -208,21 +224,22 @@ class WeightedCriticSelector:
                 W_arr[i] *= max(0.0, 1.0 - excess)
         W_arr = np.clip(W_arr, 0.0, 1.0)
 
-        # Weighted sum  Q_i(t)  (PDF Eq. 2)
-        Q_arr = (self.cfg.alpha_E * E_arr
+        # Weighted sum  H_i(t)  (PDF Eq. 2; renamed Q→H, review §5.8)
+        H_arr = (self.cfg.alpha_E * E_arr
                + self.cfg.alpha_L * L_arr
                + self.cfg.alpha_C * C_arr
                + self.cfg.alpha_S * S_arr
                + self.cfg.alpha_P * P_arr
                + self.cfg.alpha_W * W_arr)
 
-        scores = {a: float(Q_arr[i]) for i, a in enumerate(self.agents)}
+        scores = {a: float(H_arr[i]) for i, a in enumerate(self.agents)}
         components = {
             a: {
                 "E": float(E_arr[i]), "L": float(L_arr[i]),
                 "C": float(C_arr[i]), "S": float(S_arr[i]),
                 "P": float(P_arr[i]), "W": float(W_arr[i]),
-                "Q": float(Q_arr[i]),
+                "H": float(H_arr[i]),
+                "Q": float(H_arr[i]),   # alias for legacy plot scripts
             }
             for i, a in enumerate(self.agents)
         }
@@ -234,18 +251,30 @@ class WeightedCriticSelector:
         energy:         Dict[str, float],
         prev_active:    str,
         default_agent:  str,
+        duty_share:     Dict[str, float] = None,
+        sync_rate:      Dict[str, float] = None,
     ) -> str:
         """
-        Select i*(t) = argmax_i Q_i(t) subject to threshold checks.
+        Select i*(t) = argmax_{i ∈ E_set(t)} H_i(t)   (review §5.8).
 
-        PDF §3.3 flowchart: compute Q_i → meets thresholds? → assign / fallback.
+        Eligibility set:
+            E_set(t) = { i : E_i ≥ energy_threshold,
+                             duty_share_i ≤ load_max,
+                             R_sync,i ≥ sync_rate_min }
+
+        duty_share / sync_rate are optional: if omitted, those gates pass
+        (backward compatible with the original energy-only signature).
 
         Fallback priority:
             1. previous valid critic (continuity)
             2. default_agent (uav_0, backward compat)
         """
+        duty_share = duty_share or {}
+        sync_rate  = sync_rate  or {}
         eligible = [a for a in self.agents
-                    if energy.get(a, 1.0) >= self.cfg.energy_threshold]
+                    if energy.get(a, 1.0) >= self.cfg.energy_threshold
+                    and duty_share.get(a, 0.0) <= self.cfg.load_max
+                    and sync_rate.get(a, float("inf")) >= self.cfg.sync_rate_min]
 
         if not eligible:
             # Fallback: previous host if still in swarm, else default
